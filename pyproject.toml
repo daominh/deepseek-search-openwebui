@@ -1,0 +1,19 @@
+[project]
+name = "search-transformer"
+version = "0.1.0"
+description = "Proxy that adapts a DeepSeek search API to Open WebUI's External web search engine"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "uvicorn>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "respx>=0.21",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
