@@ -374,6 +374,21 @@ def test_base_url_trailing_slash(client, monkeypatch, base):
     assert route.called
 
 
+@pytest.mark.parametrize(
+    "base",
+    [BASE + "/tools/search", BASE + "/tools/search/", BASE + "/tools/fetch"],
+)
+@respx.mock
+def test_base_url_tool_suffix_stripped_with_one_warning(client, monkeypatch, caplog, base):
+    monkeypatch.setenv("DEEPSEEK_API_URL", base)
+    route = respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=results(item(1))))
+    for _ in range(2):
+        r = client.post("/search", json={"query": "q", "count": 3})
+        assert r.status_code == 200 and len(r.json()) == 1
+    assert route.call_count == 2
+    assert caplog.text.count("should be the base URL") == 1
+
+
 @respx.mock
 def test_old_env_names_are_ignored(client, monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_URL")

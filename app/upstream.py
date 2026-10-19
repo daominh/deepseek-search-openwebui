@@ -3,6 +3,7 @@
 import logging
 import math
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -37,9 +38,20 @@ class Config:
         return f"{self.base_url}/tools/{tool}"
 
 
+_TOOL_SUFFIX = re.compile(r"/tools/[^/]*$")
+_warned_tool_suffix: set[str] = set()
+
+
 def config() -> Config | None:
     """Upstream base URL and API key from the environment, or None when the base URL is unset."""
-    base_url = os.getenv("DEEPSEEK_API_URL", "").rstrip("/")
+    raw = os.getenv("DEEPSEEK_API_URL", "")
+    base_url = raw.rstrip("/")
+    if _TOOL_SUFFIX.search(base_url):
+        # e.g. the pre-rename SEARCH_API_URL value, .../v1/tools/search.
+        base_url = _TOOL_SUFFIX.sub("", base_url).rstrip("/")
+        if raw not in _warned_tool_suffix:
+            _warned_tool_suffix.add(raw)
+            logger.warning("DEEPSEEK_API_URL should be the base URL; ignoring its /tools/... suffix")
     if not base_url:
         logger.warning("DEEPSEEK_API_URL is not set")
         return None

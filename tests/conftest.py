@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from app import upstream
 from app.main import app
 
 BASE = "https://upstream.test/v1"
@@ -14,6 +15,7 @@ def env(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-key")
     for name in ("SEARCH_TIMEOUT", "FETCH_TIMEOUT", "FETCH_UNESCAPE_MARKDOWN"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(upstream, "_warned_tool_suffix", set())
 
 
 @pytest.fixture

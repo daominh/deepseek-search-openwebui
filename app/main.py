@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import weakref
 from typing import Any
 
 import httpx
@@ -17,9 +18,24 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 app = FastAPI(title="search-transformer")
 
 FETCH_CONCURRENCY = 5
+MAX_FETCH_URLS = 100
 
 # A backslash before any ASCII punctuation character (CommonMark's escapable set).
 _MARKDOWN_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+
+# DeepSeek rate-limits per account, so the cap is shared by all requests (one semaphore per event loop,
+# as asyncio primitives can't cross loops; uvicorn runs a single loop).
+_fetch_semaphores: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _fetch_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    semaphore = _fetch_semaphores.get(loop)
+    if semaphore is None:
+        semaphore = _fetch_semaphores[loop] = asyncio.Semaphore(FETCH_CONCURRENCY)
+    return semaphore
 
 
 def _str_or_empty(value: Any) -> str:
@@ -58,6 +74,11 @@ def parse_page(payload: Any) -> tuple[str, str]:
 
 def unescape_markdown(text: str) -> str:
     return _MARKDOWN_ESCAPE.sub(r"\1", text)
+
+
+def _log_url(url: str) -> str:
+    """The URL for logs: without query string or fragment (they can carry tokens), at most 200 chars."""
+    return url.split("?", 1)[0].split("#", 1)[0][:200]
 
 
 def _unescape_enabled() -> bool:
@@ -104,6 +125,9 @@ async def fetch(request: Request) -> list[dict[str, Any]] | Response:
     except Exception as exc:
         logger.warning("bad inbound body: %s: %s", type(exc).__name__, exc)
         return error(400, "request body must be a JSON object with a 'urls' list of strings")
+    if len(urls) > MAX_FETCH_URLS:
+        logger.warning("bad inbound body: %d urls, more than %d", len(urls), MAX_FETCH_URLS)
+        return error(400, f"at most {MAX_FETCH_URLS} urls per request")
 
     if not urls:
         return []
@@ -111,12 +135,14 @@ async def fetch(request: Request) -> list[dict[str, Any]] | Response:
     if cfg is None:
         return error(502, "upstream fetch API is not configured")
 
-    semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
+    semaphore = _fetch_semaphore()
 
     async def fetch_one(url: str) -> tuple[str, str] | UpstreamError:
         async with semaphore:
             try:
-                return await call(client, cfg, "fetch", {"url": url}, parse_page, context=f"fetch {url!r}: ")
+                return await call(
+                    client, cfg, "fetch", {"url": url}, parse_page, context=f"fetch {_log_url(url)!r}: "
+                )
             except UpstreamError as exc:
                 return exc
 

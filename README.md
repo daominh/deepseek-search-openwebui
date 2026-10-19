@@ -6,7 +6,8 @@ A small HTTP proxy that lets Open WebUI use the DeepSeek tools API for web searc
   `$DEEPSEEK_API_URL/tools/search` (with `Authorization: Bearer $DEEPSEEK_API_KEY`) and reshapes the
   `{"results": [{title, url, snippet}]}` response into Open WebUI's `[{link, title, snippet}]` format.
 - `POST /fetch` for the **External** web loader. It takes `{"urls": [...]}`, calls
-  `$DEEPSEEK_API_URL/tools/fetch` with `{"url": ...}` once per URL (at most 5 at a time), and returns
+  `$DEEPSEEK_API_URL/tools/fetch` with `{"url": ...}` once per URL (at most 5 calls at a time across all
+  requests, since DeepSeek rate-limits per account; at most 100 URLs per request), and returns
   `[{"page_content": <markdown>, "metadata": {"source": <input url>, "title": <title>}}]` in input order.
   `metadata.source` is always the input URL string, unchanged.
 
@@ -25,11 +26,22 @@ The inbound `Authorization` header is ignored on both endpoints.
 
 A timeout that is not a positive finite number falls back to 30.
 
+DeepSeek returns code as plain lines (no fenced blocks or inline code spans), escaped like the surrounding text,
+so the unescape applies to the whole page: `\- \\d` becomes `- \d`.
+
+### Upgrading
+
+The old variable names are no longer read; rename them in `.env`:
+
+- `SEARCH_API_URL` → `DEEPSEEK_API_URL`, now the base URL (e.g. `https://api.deepseek.com/v1`, not `.../tools/search`).
+  A leftover `/tools/...` suffix is stripped, with a warning in the log.
+- `API_KEY` → `DEEPSEEK_API_KEY`.
+
 ## Errors
 
 | Situation | Response |
 | --- | --- |
-| Inbound body is not valid JSON or not a JSON object (for `/fetch`: or `urls` is not a list of strings) | `400` `{"error": "..."}`; upstream is not called |
+| Inbound body is not valid JSON or not a JSON object (for `/fetch`: or `urls` is not a list of at most 100 strings) | `400` `{"error": "..."}`; upstream is not called |
 | Upstream returns non-2xx | Passed through as is: same status code, body bytes and `Content-Type` (no other upstream headers) |
 | Upstream times out | `504` `{"error": "..."}` |
 | No upstream response (network error, malformed or unset `DEEPSEEK_API_URL`, non-ASCII `DEEPSEEK_API_KEY`, any other error) | `502` `{"error": "..."}` |

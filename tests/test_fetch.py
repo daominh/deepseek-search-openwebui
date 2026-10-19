@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 import time
@@ -7,7 +8,7 @@ import httpx
 import pytest
 import respx
 
-from app.main import unescape_markdown
+from app.main import app, unescape_markdown
 from app.upstream import timeout
 from tests.conftest import FETCH as UPSTREAM
 from tests.conftest import assert_error
@@ -136,6 +137,30 @@ def test_bad_inbound_body(client, raw):
     r = client.post("/fetch", content=raw, headers={"Content-Type": "application/json"})
     assert_error(r, 400)
     assert not route.called
+
+
+@respx.mock
+def test_url_count_cap(client):
+    route = respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=page(1)))
+    r = client.post("/fetch", json={"urls": [f"https://e.test/{i}" for i in range(101)]})
+    assert_error(r, 400)
+    assert not route.called
+    r = client.post("/fetch", json={"urls": [f"https://e.test/{i}" for i in range(100)]})
+    assert r.status_code == 200 and len(r.json()) == 100
+
+
+@respx.mock
+def test_failure_log_drops_query_and_truncates_url(client, caplog):
+    long_path = "https://e.test/" + "p" * 300
+    urls = ["https://e.test/page?token=hunter2#frag", "https://e.test/doc#frag=x", long_path]
+    respx.post(UPSTREAM).mock(return_value=httpx.Response(404, json={"error": {"message": "nope"}}))
+    r = client.post("/fetch", json={"urls": urls})
+    assert r.status_code == 404
+    warnings = [rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"]
+    assert any("'https://e.test/page'" in w for w in warnings)
+    assert any("'https://e.test/doc'" in w for w in warnings)
+    assert any(f"{long_path[:200]!r}" in w for w in warnings)
+    assert "hunter2" not in caplog.text and "frag" not in caplog.text and long_path[:201] not in caplog.text
 
 
 def test_missing_upstream_url(client, monkeypatch):
@@ -302,6 +327,22 @@ def test_unescape_markdown():
     assert unescape_markdown("\\a\\1\\ \\\n\\é\\") == "\\a\\1\\ \\\n\\é\\"
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Live DeepSeek output: code is emitted as plain lines (no ``` fences or `spans`) and escaped like prose.
+        (
+            r'PS\> powershell \-ExecutionPolicy ByPass \-c \"irm https\:\/\/astral\.sh\/uv\/install\.ps1 \| iex\"',
+            'PS> powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"',
+        ),
+        (r"\- \\d" + "\n\nMatches any decimal digit", "- \\d\n\nMatches any decimal digit"),
+        ("a backslash\\:\n\\\\\\+\nmatches a literal plus", "a backslash:\n\\+\nmatches a literal plus"),
+    ],
+)
+def test_unescape_live_code_samples(raw, expected):
+    assert unescape_markdown(raw) == expected
+
+
 ESCAPED = "\\# Title\n\nself\\-hosted \\[link\\]\\(x\\) a\\\\b"
 UNESCAPED = "# Title\n\nself-hosted [link](x) a\\b"
 
@@ -344,8 +385,11 @@ def test_fetch_timeout_env(monkeypatch, value, expected):
 
 @pytest.fixture
 def fake_deepseek(monkeypatch):
-    """A local threaded fetch API: answers each URL after `delays[url]` seconds and records concurrency."""
-    state = {"delays": {}, "in_flight": 0, "max_in_flight": 0, "paths": set(), "auth": set()}
+    """A local threaded fetch API: answers each URL after `delays[url]` seconds and records concurrency.
+
+    URLs in `statuses` get that status with a DeepSeek-style error body naming the URL.
+    """
+    state = {"delays": {}, "statuses": {}, "in_flight": 0, "max_in_flight": 0, "paths": set(), "auth": set()}
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -359,8 +403,13 @@ def fake_deepseek(monkeypatch):
             time.sleep(state["delays"].get(url, 0.05))
             with lock:
                 state["in_flight"] -= 1
-            payload = json.dumps({"title": url, "content": f"content of {url}"}).encode()
-            self.send_response(200)
+            status = state["statuses"].get(url, 200)
+            if status == 200:
+                payload = json.dumps({"title": url, "content": f"content of {url}"}).encode()
+            else:
+                payload = json.dumps({"error": {"message": f"failed: {url}", "type": "x", "param": None, "code": None}})
+                payload = payload.encode()
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -389,6 +438,31 @@ def test_order_preserved_and_concurrency_capped(client, fake_deepseek):
     assert fake_deepseek["max_in_flight"] == 5
     assert fake_deepseek["paths"] == {"/v1/tools/fetch"}
     assert fake_deepseek["auth"] == {"Bearer secret-key"}
+
+
+def test_concurrency_cap_shared_across_requests(fake_deepseek):
+    urls = [[f"https://r{n}.test/{i}" for i in range(8)] for n in range(2)]
+    fake_deepseek["delays"] = {url: 0.1 for batch in urls for url in batch}
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://app") as c:
+            return await asyncio.gather(*(c.post("/fetch", json={"urls": batch}) for batch in urls))
+
+    responses = asyncio.run(run())
+    for batch, r in zip(urls, responses):
+        assert r.status_code == 200
+        assert [d["metadata"]["source"] for d in r.json()] == batch
+    assert fake_deepseek["max_in_flight"] == 5
+
+
+def test_all_failed_returns_first_url_error_not_first_to_finish(client, fake_deepseek):
+    urls = ["https://slow-404.test/", "https://fast-500.test/", "https://fast-429.test/"]
+    fake_deepseek["delays"] = {urls[0]: 0.5, urls[1]: 0.0, urls[2]: 0.0}
+    fake_deepseek["statuses"] = {urls[0]: 404, urls[1]: 500, urls[2]: 429}
+    r = client.post("/fetch", json={"urls": urls})
+    assert r.status_code == 404
+    assert r.json()["error"]["message"] == f"failed: {urls[0]}"
 
 
 def test_fetch_timeout_applies(client, monkeypatch, fake_deepseek):
