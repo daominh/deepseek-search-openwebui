@@ -3,7 +3,19 @@
 A small HTTP proxy that lets Open WebUI's **External** web search engine use a DeepSeek search API.
 It forwards `POST /search` bodies unchanged to `SEARCH_API_URL` (with `Authorization: Bearer $API_KEY`)
 and reshapes the `{"results": [{title, url, snippet}]}` response into Open WebUI's
-`[{link, title, snippet}]` format. Any failure returns `[]`.
+`[{link, title, snippet}]` format.
+
+## Errors
+
+| Situation | Response |
+| --- | --- |
+| Inbound body is not valid JSON or not a JSON object | `400` `{"error": "..."}`; upstream is not called |
+| Upstream returns non-2xx | Passed through as is: same status code, body bytes and `Content-Type` (no other upstream headers) |
+| Upstream times out | `504` `{"error": "..."}` |
+| No upstream response (network error, malformed or unset `SEARCH_API_URL`, non-ASCII `API_KEY`, any other error) | `502` `{"error": "..."}` |
+| Upstream 2xx body is not valid JSON, not an object, or has no `results` list | `502` `{"error": "..."}` |
+
+Error messages and logs never contain the API key or request headers. Each failure logs one warning.
 
 ## Run
 
