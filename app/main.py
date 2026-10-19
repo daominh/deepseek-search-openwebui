@@ -35,15 +35,26 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": message})
 
 
+def _scrub(text: str, secret: str) -> str:
+    """Remove the key from text, including its escaped forms (as in str or bytes reprs)."""
+    if not secret:
+        return text
+    forms = {secret, repr(secret)[1:-1]}
+    try:
+        forms.add(repr(secret.encode())[2:-1])
+    except UnicodeEncodeError:
+        pass
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, "***")
+    return text
+
+
 def _describe(exc: BaseException, secret: str) -> str:
     """Exception type and message, safe to log: never includes the API key."""
-    if isinstance(exc, UnicodeError):
-        # The message quotes characters of the offending header value, i.e. of the key.
-        return f"{type(exc).__name__}: request headers are not ASCII-encodable"
-    message = str(exc)
-    if secret:
-        message = message.replace(secret, "***")
-    return f"{type(exc).__name__}: {message}"
+    if isinstance(exc, (UnicodeError, httpx.LocalProtocolError)):
+        # These messages quote the offending header value, i.e. the key.
+        return type(exc).__name__
+    return f"{type(exc).__name__}: {_scrub(str(exc), secret)}"
 
 
 def transform(payload: Any, count: Any) -> list[dict[str, str]]:
@@ -86,7 +97,7 @@ async def search(request: Request) -> list[dict[str, str]] | Response:
         return _error(400, "request body must be a JSON object")
 
     url = os.getenv("SEARCH_API_URL", "")
-    api_key = os.getenv("API_KEY", "")
+    api_key = os.getenv("API_KEY", "").strip()
     if not url:
         logger.warning("SEARCH_API_URL is not set")
         return _error(502, "upstream search API is not configured")
@@ -108,16 +119,18 @@ async def search(request: Request) -> list[dict[str, str]] | Response:
 
     if not resp.is_success:
         # Pass the upstream error through: same status, body bytes and Content-Type only.
-        logger.warning("upstream returned HTTP %s: %.500s", resp.status_code, resp.text)
-        content_type = resp.headers.get("content-type")
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers={"Content-Type": content_type} if content_type else None,
-        )
+        logger.warning("upstream returned HTTP %s: %.500s", resp.status_code, _scrub(resp.text, api_key))
+        out = Response(content=resp.content, status_code=resp.status_code)
+        # Raw bytes: a decoded value may not survive re-encoding (e.g. non-latin-1 parameters).
+        content_type = next((v for k, v in resp.headers.raw if k.lower() == b"content-type"), None)
+        if content_type is not None:
+            out.raw_headers.append((b"content-type", content_type))
+        return out
 
     try:
         return transform(resp.json(), body.get("count"))
     except Exception as exc:
-        logger.warning("invalid upstream response: %s; body: %.500s", _describe(exc, api_key), resp.text)
+        logger.warning(
+            "invalid upstream response: %s; body: %.500s", _describe(exc, api_key), _scrub(resp.text, api_key)
+        )
         return _error(502, "upstream search API returned an invalid response")

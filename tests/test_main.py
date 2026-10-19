@@ -1,11 +1,15 @@
+import asyncio
+import gzip
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from app.main import _timeout, app
+from app.main import _describe, _timeout, app
 
 UPSTREAM = "https://upstream.test/search"
 
@@ -261,6 +265,115 @@ def test_bad_inbound_body(client, raw):
     r = client.post("/search", content=raw, headers={"Content-Type": "application/json"})
     assert_error(r, 400)
     assert not route.called
+
+
+@pytest.fixture
+def real_upstream(monkeypatch):
+    """A local HTTP server, so requests go through real header serialization (h11)."""
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append(self.headers.get("Authorization"))
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            payload = json.dumps(results(item(1))).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("SEARCH_API_URL", f"http://127.0.0.1:{server.server_port}/search")
+    yield seen
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.parametrize("key", ["secret-key\r", "secret-key\r\n", " secret-key\t", "secret-key \n"])
+def test_api_key_surrounding_whitespace_stripped(client, monkeypatch, caplog, real_upstream, key):
+    monkeypatch.setenv("API_KEY", key)
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert r.status_code == 200
+    assert r.json() == [{"link": "https://e.com/1", "title": "T1", "snippet": "S1"}]
+    assert real_upstream == ["Bearer secret-key"]
+    assert "secret-key" not in caplog.text
+
+
+@pytest.mark.parametrize("key", ["secret\rkey", "secret\nkey", "secret\r\nkey"])
+def test_api_key_with_control_chars(client, monkeypatch, caplog, real_upstream, key):
+    monkeypatch.setenv("API_KEY", key)
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert_error(r, 502)
+    assert real_upstream == []
+    assert "LocalProtocolError" in caplog.text
+    for text in (r.text, caplog.text):
+        assert "secret" not in text and "key" not in text.replace("API key", "")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "boom secret\rkey boom",
+        "boom 'secret\\rkey' boom",
+        "boom b'secret\\rkey' boom",
+    ],
+)
+def test_describe_scrubs_raw_and_escaped_key(message):
+    out = _describe(httpx.ConnectError(message), "secret\rkey")
+    assert out.startswith("ConnectError: boom ")
+    assert "secret" not in out
+
+
+@respx.mock
+def test_non_2xx_log_scrubbed_body_unchanged(client, caplog):
+    content = b'{"error": "bad key secret-key"}'
+    respx.post(UPSTREAM).mock(
+        return_value=httpx.Response(401, content=content, headers={"Content-Type": "application/json"})
+    )
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert r.status_code == 401 and r.content == content
+    assert "401" in caplog.text
+    assert "secret-key" not in caplog.text
+
+
+@respx.mock
+def test_non_2xx_non_latin1_content_type():
+    raw_ct = "text/plain; x=€".encode()
+    respx.post(UPSTREAM).mock(
+        return_value=httpx.Response(400, content=b"bad", headers=[(b"Content-Type", raw_ct)])
+    )
+
+    # Starlette's TestClient can't represent non-ASCII response headers; ASGITransport keeps raw bytes.
+    async def call():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://app") as c:
+            return await c.post("/search", json={"query": "q", "count": 3})
+
+    r = asyncio.run(call())
+    assert r.status_code == 400 and r.content == b"bad"
+    assert [v for k, v in r.headers.raw if k.lower() == b"content-type"] == [raw_ct]
+
+
+@respx.mock
+def test_non_2xx_gzip_body_decompressed(client):
+    text = b"upstream exploded " * 50
+    respx.post(UPSTREAM).mock(
+        return_value=httpx.Response(
+            503,
+            content=gzip.compress(text),
+            headers={"Content-Type": "text/plain", "Content-Encoding": "gzip"},
+        )
+    )
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert r.status_code == 503
+    assert r.content == text
+    assert r.headers["content-length"] == str(len(text))
+    assert "content-encoding" not in r.headers
 
 
 def test_health(client):
