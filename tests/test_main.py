@@ -5,7 +5,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import _timeout, app
 
 UPSTREAM = "https://upstream.test/search"
 
@@ -122,6 +122,71 @@ def test_missing_or_invalid_results(client, payload):
     respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=payload))
     r = client.post("/search", json={"query": "q", "count": 3})
     assert r.status_code == 200 and r.json() == []
+
+
+@respx.mock
+def test_non_dict_items_skipped(client):
+    respx.post(UPSTREAM).mock(
+        return_value=httpx.Response(200, json=results(1, "x", None, ["a"], 2.5, True, item(1)))
+    )
+    r = client.post("/search", json={"query": "q", "count": 10})
+    assert r.json() == [{"link": "https://e.com/1", "title": "T1", "snippet": "S1"}]
+
+
+@pytest.mark.parametrize("url", [123, ["https://a"], {"u": 1}, True, ""])
+@respx.mock
+def test_non_str_url_skipped(client, url):
+    respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=results({"title": "x", "url": url})))
+    r = client.post("/search", json={"query": "q", "count": 5})
+    assert r.json() == []
+
+
+@pytest.mark.parametrize("value", [123, ["a"], {"k": "v"}, True, 1.5])
+@respx.mock
+def test_non_str_title_snippet_become_empty(client, value):
+    respx.post(UPSTREAM).mock(
+        return_value=httpx.Response(200, json=results({"title": value, "url": "https://a", "snippet": value}))
+    )
+    r = client.post("/search", json={"query": "q", "count": 5})
+    assert r.json() == [{"link": "https://a", "title": "", "snippet": ""}]
+
+
+def test_malformed_upstream_url(client, monkeypatch, caplog):
+    monkeypatch.setenv("SEARCH_API_URL", "http://[not a url")
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert r.status_code == 200 and r.json() == []
+    assert "upstream request failed" in caplog.text
+
+
+@respx.mock
+def test_non_ascii_api_key(client, monkeypatch, caplog):
+    monkeypatch.setenv("API_KEY", "clé-secrète-ü")
+    respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=results(item(1))))
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert r.status_code == 200 and r.json() == []
+    assert "UnicodeEncodeError" in caplog.text
+    assert "clé-secrète-ü" not in caplog.text
+
+
+@respx.mock
+def test_deeply_nested_upstream_json(client, caplog):
+    depth = 100_000
+    respx.post(UPSTREAM).mock(return_value=httpx.Response(200, content=b"[" * depth + b"]" * depth))
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert r.status_code == 200 and r.json() == []
+    assert "RecursionError" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 30.0), ("12.5", 12.5), ("0", 30.0), ("-5", 30.0), ("nan", 30.0), ("inf", 30.0), ("abc", 30.0)],
+)
+def test_timeout_env(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("SEARCH_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("SEARCH_TIMEOUT", value)
+    assert _timeout() == expected
 
 
 @pytest.mark.parametrize("raw", [b"not json", b"[1,2]"])
