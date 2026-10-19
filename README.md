@@ -10,10 +10,36 @@ and reshapes the `{"results": [{title, url, snippet}]}` response into Open WebUI
 ```sh
 cp .env.example .env   # fill in SEARCH_API_URL and API_KEY
 docker compose up -d --build
-curl -s localhost:8000/health
+curl -s localhost:8000/health   # only after exposing a port, see below
 ```
 
-Set `PORT=<port>` to publish on a different host port. `SEARCH_TIMEOUT` (seconds, default 30) sets the upstream timeout.
+By default no host port is published: the service is reachable only on its Docker network, at `http://search-transformer:8000/search`.
+
+### Local overrides
+
+Create a `docker-compose.override.yml` (picked up automatically by compose, gitignored) when you need more.
+
+Expose on the host (Open WebUI then uses `http://<host>:8000/search`):
+
+```yaml
+services:
+  search-transformer:
+    ports: ["8000:8000"]
+```
+
+Join Open WebUI's existing Docker network (check the name with `docker network ls`):
+
+```yaml
+services:
+  search-transformer:
+    networks: [default, openwebui]
+networks:
+  openwebui:
+    external: true
+    name: open-webui_default
+```
+
+`SEARCH_TIMEOUT` (seconds, default 30) sets the upstream timeout.
 
 For local development: `uv sync`, `uv run pytest`, `uv run uvicorn app.main:app --reload`.
 
@@ -22,6 +48,5 @@ For local development: `uv sync`, `uv run pytest`, `uv run uvicorn app.main:app 
 Admin Settings → Web Search:
 
 - Web Search Engine: `external`
-- External Web Search URL: `http://<host>:8000/search`
-  (or `http://search-transformer:8000/search` if Open WebUI shares a docker network with this service)
+- External Web Search URL: `http://search-transformer:8000/search` (same Docker network), or `http://<host>:8000/search` with the port exposed
 - External Web Search API Key: any value (it is ignored)
