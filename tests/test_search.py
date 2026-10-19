@@ -7,22 +7,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 import respx
-from fastapi.testclient import TestClient
 
-from app.main import _describe, _timeout, app
-
-UPSTREAM = "https://upstream.test/search"
-
-
-@pytest.fixture(autouse=True)
-def env(monkeypatch):
-    monkeypatch.setenv("SEARCH_API_URL", UPSTREAM)
-    monkeypatch.setenv("API_KEY", "secret-key")
-
-
-@pytest.fixture
-def client():
-    return TestClient(app)
+from app.main import app
+from app.upstream import describe, timeout
+from tests.conftest import BASE, assert_error
+from tests.conftest import SEARCH as UPSTREAM
 
 
 def results(*items):
@@ -31,14 +20,6 @@ def results(*items):
 
 def item(n):
     return {"title": f"T{n}", "url": f"https://e.com/{n}", "snippet": f"S{n}"}
-
-
-def assert_error(r, status):
-    assert r.status_code == status
-    assert r.headers["content-type"] == "application/json"
-    body = r.json()
-    assert set(body) == {"error"} and isinstance(body["error"], str) and body["error"]
-    assert "secret-key" not in r.text
 
 
 @respx.mock
@@ -164,7 +145,7 @@ def test_exception_message_with_key_is_scrubbed(client, caplog):
 
 
 def test_missing_upstream_url(client, monkeypatch):
-    monkeypatch.delenv("SEARCH_API_URL")
+    monkeypatch.delenv("DEEPSEEK_API_URL")
     r = client.post("/search", json={"query": "q", "count": 3})
     assert_error(r, 502)
 
@@ -216,7 +197,7 @@ def test_non_str_title_snippet_become_empty(client, value):
     [("http://example.com:abc/", "InvalidURL"), ("not-a-url", "UnsupportedProtocol")],
 )
 def test_malformed_upstream_url(client, monkeypatch, caplog, url, exc_name):
-    monkeypatch.setenv("SEARCH_API_URL", url)
+    monkeypatch.setenv("DEEPSEEK_API_URL", url)
     r = client.post("/search", json={"query": "q", "count": 3})
     assert_error(r, 502)
     assert "upstream request failed" in caplog.text
@@ -226,7 +207,7 @@ def test_malformed_upstream_url(client, monkeypatch, caplog, url, exc_name):
 @respx.mock
 def test_non_ascii_api_key(client, monkeypatch, caplog):
     key = "clé-secrète-ü"
-    monkeypatch.setenv("API_KEY", key)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", key)
     route = respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=results(item(1))))
     r = client.post("/search", json={"query": "q", "count": 3})
     assert_error(r, 502)
@@ -255,7 +236,7 @@ def test_timeout_env(monkeypatch, value, expected):
         monkeypatch.delenv("SEARCH_TIMEOUT", raising=False)
     else:
         monkeypatch.setenv("SEARCH_TIMEOUT", value)
-    assert _timeout() == expected
+    assert timeout("SEARCH_TIMEOUT") == expected
 
 
 @pytest.mark.parametrize("raw", [b"not json", b"[1,2]", b'"q"', b"null", b""])
@@ -274,6 +255,9 @@ def real_upstream(monkeypatch):
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
+            if self.path != "/v1/tools/search":
+                self.send_error(404)
+                return
             seen.append(self.headers.get("Authorization"))
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
             payload = json.dumps(results(item(1))).encode()
@@ -288,7 +272,7 @@ def real_upstream(monkeypatch):
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    monkeypatch.setenv("SEARCH_API_URL", f"http://127.0.0.1:{server.server_port}/search")
+    monkeypatch.setenv("DEEPSEEK_API_URL", f"http://127.0.0.1:{server.server_port}/v1")
     yield seen
     server.shutdown()
     server.server_close()
@@ -296,7 +280,7 @@ def real_upstream(monkeypatch):
 
 @pytest.mark.parametrize("key", ["secret-key\r", "secret-key\r\n", " secret-key\t", "secret-key \n"])
 def test_api_key_surrounding_whitespace_stripped(client, monkeypatch, caplog, real_upstream, key):
-    monkeypatch.setenv("API_KEY", key)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", key)
     r = client.post("/search", json={"query": "q", "count": 3})
     assert r.status_code == 200
     assert r.json() == [{"link": "https://e.com/1", "title": "T1", "snippet": "S1"}]
@@ -306,7 +290,7 @@ def test_api_key_surrounding_whitespace_stripped(client, monkeypatch, caplog, re
 
 @pytest.mark.parametrize("key", ["secret\rkey", "secret\nkey", "secret\r\nkey"])
 def test_api_key_with_control_chars(client, monkeypatch, caplog, real_upstream, key):
-    monkeypatch.setenv("API_KEY", key)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", key)
     r = client.post("/search", json={"query": "q", "count": 3})
     assert_error(r, 502)
     assert real_upstream == []
@@ -324,7 +308,7 @@ def test_api_key_with_control_chars(client, monkeypatch, caplog, real_upstream, 
     ],
 )
 def test_describe_scrubs_raw_and_escaped_key(message):
-    out = _describe(httpx.ConnectError(message), "secret\rkey")
+    out = describe(httpx.ConnectError(message), "secret\rkey")
     assert out.startswith("ConnectError: boom ")
     assert "secret" not in out
 
@@ -378,3 +362,25 @@ def test_non_2xx_gzip_body_decompressed(client):
 
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("base", [BASE + "/", BASE + "//"])
+@respx.mock
+def test_base_url_trailing_slash(client, monkeypatch, base):
+    monkeypatch.setenv("DEEPSEEK_API_URL", base)
+    route = respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json=results(item(1))))
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert r.status_code == 200 and len(r.json()) == 1
+    assert route.called
+
+
+@respx.mock
+def test_old_env_names_are_ignored(client, monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_URL")
+    monkeypatch.delenv("DEEPSEEK_API_KEY")
+    monkeypatch.setenv("SEARCH_API_URL", UPSTREAM)
+    monkeypatch.setenv("API_KEY", "secret-key")
+    route = respx.post(UPSTREAM)
+    r = client.post("/search", json={"query": "q", "count": 3})
+    assert_error(r, 502)
+    assert not route.called
